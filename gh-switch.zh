@@ -1,0 +1,347 @@
+# gh-switch — pick an SSH key, become that GitHub account.
+#
+#   gh                 pick a key from ~/.ssh (the account comes from GitHub)
+#   gh <account>       switch straight to an account you've already used
+#   gh --keys          list the SSH keys in ~/.ssh and who each one is
+#   gh --list          list known accounts
+#   gh --status        who this shell is right now
+#   gh --add <path>    register a key without the picker
+#   gh --refresh       re-fetch name/email for the current account
+#   gh --forget <acct>
+#   gh --off           back to the default SSH key
+#
+# Accounts live in ~/.config/gh-switch/identities, tab separated:
+# login, key path, login, commit name, commit email.
+
+GH_SWITCH_DIR="${GH_SWITCH_DIR:-$HOME/.config/gh-switch}"
+GH_SWITCH_DB="$GH_SWITCH_DIR/identities"
+GH_SWITCH_LAST="$GH_SWITCH_DIR/last"
+
+_gh_switch_lookup() {
+  [[ -r $GH_SWITCH_DB ]] || return 1
+  local line
+  while IFS= read -r line; do
+    [[ $line == "$1"$'\t'* ]] && { print -r -- "$line"; return 0 }
+  done < "$GH_SWITCH_DB"
+  return 1
+}
+
+_gh_switch_save() {
+  local name=$1 key=$2 account=$3 aname=$4 amail=$5
+  mkdir -p "$GH_SWITCH_DIR" && chmod 700 "$GH_SWITCH_DIR"
+  local tmp="$GH_SWITCH_DB.$$"
+  : > "$tmp" && chmod 600 "$tmp" || return 1
+  [[ -r $GH_SWITCH_DB ]] && awk -F'\t' -v n="$name" 'NF && $1 != n' "$GH_SWITCH_DB" >> "$tmp"
+  print -r -- "${name}"$'\t'"${key}"$'\t'"${account}"$'\t'"${aname}"$'\t'"${amail}" >> "$tmp"
+  mv -f "$tmp" "$GH_SWITCH_DB"
+}
+
+_gh_switch_clean_path() {
+  setopt localoptions extended_glob
+  local p=$1
+  p=${p##[[:space:]]#}; p=${p%%[[:space:]]#}
+  p=${p#[\"\']}; p=${p%[\"\']}
+  p=${~p}
+  [[ $p == *.pub && -r ${p%.pub} ]] && p=${p%.pub}
+  [[ $p != */* && -r $HOME/.ssh/$p ]] && p=$HOME/.ssh/$p
+  [[ ! -e $p && $p == *//* ]] && p="/${p##*//}"
+  print -r -- "$p"
+}
+
+_gh_switch_find_keys() {
+  # private keys in ~/.ssh (and one level down), newest first
+  emulate -L zsh
+  setopt localoptions null_glob extended_glob
+  local f
+  for f in $HOME/.ssh/*(.Nom) $HOME/.ssh/*/*(.Nom); do
+    case ${f:t} in
+      *.pub|config|known_hosts|known_hosts.old|authorized_keys|environment) continue ;;
+    esac
+    LC_ALL=C head -c 400 -- "$f" 2>/dev/null | grep -q -- '-----BEGIN .*PRIVATE KEY-----' \
+      && print -r -- "$f"
+  done
+}
+
+_gh_switch_key_type() {
+  local pub="$1.pub"
+  [[ -r $pub ]] || return 0
+  local -a parts; parts=(${=$(<"$pub")})
+  local type=${parts[1]#ssh-}
+  print -r -- "${type%%-*}"
+}
+
+_gh_switch_account_for_key() {
+  # the login we already resolved for this key, if any
+  [[ -r $GH_SWITCH_DB ]] || return 0
+  awk -F'\t' -v k="$1" 'NF && $2 == k { print $1; exit }' "$GH_SWITCH_DB"
+}
+
+_gh_switch_ask() {
+  local prompt=$1 var=$2
+  local REPLY_BUF=''
+  if [[ -o interactive && -t 0 ]] && zmodload -e zsh/zle 2>/dev/null; then
+    vared -p "$prompt" REPLY_BUF || return 1
+  else
+    read -r "REPLY_BUF?$prompt" || return 1
+  fi
+  : ${(P)var::="$REPLY_BUF"}
+}
+
+_gh_switch_resolve_account() {
+  # asks GitHub who this key is. `ssh -T` always exits non-zero, so we read
+  # the greeting instead of the status.
+  local key=$1 out
+  out=$(ssh -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+           -o ConnectTimeout=10 -T git@github.com 2>&1)
+  # the greeting is not always the first line — ssh may warn about known_hosts
+  local login
+  login=$(print -r -- "$out" | sed -n 's/^Hi \([^!]*\)!.*/\1/p' | head -1)
+  if [[ -n $login ]]; then
+    print -r -- "$login"
+    return 0
+  fi
+  print -r -- "$out" >&2
+  return 1
+}
+
+_gh_switch_resolve_author() {
+  # display name + commit email from the public profile, tab separated.
+  # GitHub hides real addresses, so we fall back to the noreply form it
+  # uses to link commits to the account.
+  local login=$1 json name email id
+  json=$(curl -fsS --max-time 10 -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/users/${login}" 2>/dev/null) || return 1
+  name=$(print -r -- "$json"  | sed -n 's/^ *"name" *: *"\(.*\)".*/\1/p'  | head -1)
+  email=$(print -r -- "$json" | sed -n 's/^ *"email" *: *"\(.*\)".*/\1/p' | head -1)
+  id=$(print -r -- "$json"    | sed -n 's/^ *"id" *: *\([0-9][0-9]*\).*/\1/p' | head -1)
+  [[ -z $name ]] && name=$login
+  [[ -z $email && -n $id ]] && email="${id}+${login}@users.noreply.github.com"
+  print -r -- "${name}"$'\t'"${email}"
+}
+
+_gh_switch_apply() {
+  local name=$1 key=$2 aname=$3 amail=$4
+  export GIT_SSH_COMMAND="ssh -i ${(q)key} -o IdentitiesOnly=yes"
+  export GH_IDENTITY="$name"
+  if [[ -n $aname ]]; then
+    export GIT_AUTHOR_NAME="$aname" GIT_COMMITTER_NAME="$aname"
+  else
+    unset GIT_AUTHOR_NAME GIT_COMMITTER_NAME
+  fi
+  if [[ -n $amail ]]; then
+    export GIT_AUTHOR_EMAIL="$amail" GIT_COMMITTER_EMAIL="$amail"
+  else
+    unset GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL
+  fi
+  print -r -- "$name" > "$GH_SWITCH_LAST" 2>/dev/null
+}
+
+_gh_switch_register() {
+  # resolve a key -> account -> author, save it, switch to it
+  local key=$1 account aname amail author
+  print -r -- "  asking github who ${key/#$HOME/~} is..."
+  account=$(_gh_switch_resolve_account "$key") || {
+    print -u2 -- "gh: ${key/#$HOME/~} isn't on any github account yet."
+    print -u2 -- "    pbcopy < ${key/#$HOME/~}.pub"
+    print -u2 -- "    then add it at https://github.com/settings/keys and run gh again"
+    return 1
+  }
+  if author=$(_gh_switch_resolve_author "$account"); then
+    aname=${author%%$'\t'*}; amail=${author#*$'\t'}
+  else
+    print -r -- "  (couldn't reach the github api — commits will use your git config)"
+  fi
+  _gh_switch_save "$account" "$key" "$account" "$aname" "$amail"
+  _gh_switch_apply "$account" "$key" "$aname" "$amail"
+  print -r -- "✓ github identity: ${account}${amail:+  (${aname} <${amail}>)}"
+}
+
+_gh_switch_pick() {
+  # the whole point: show the keys, pick one, become whoever it is
+  emulate -L zsh
+  setopt localoptions extended_glob
+  local -a keys; keys=( ${(f)"$(_gh_switch_find_keys)"} )
+
+  if (( ${#keys} == 0 )); then
+    print -r -- "no private keys in ~/.ssh. make one with:"
+    print -r -- "  ssh-keygen -t ed25519 -C <github-username> -f ~/.ssh/<github-username>"
+    return 1
+  fi
+
+  local i acct type mark
+  print -r -- "ssh keys in ~/.ssh:"
+  for (( i = 1; i <= ${#keys}; i++ )); do
+    acct=$(_gh_switch_account_for_key "${keys[i]}")
+    type=$(_gh_switch_key_type "${keys[i]}")
+    mark=''
+    [[ -n $acct && $acct == $GH_IDENTITY ]] && mark='  *'
+    printf '  %d) %-22s %-8s %s%s\n' $i "${keys[i]#$HOME/.ssh/}" "$type" \
+           "${acct:+github.com/}${acct:-(not checked yet)}" "$mark"
+  done
+  print -r -- "  o) other path…"
+
+  local choice
+  while true; do
+    choice=''
+    read -r "choice?pick a key [1-${#keys}, o]: " || return 1
+    choice=${choice##[[:space:]]#}; choice=${choice%%[[:space:]]#}
+    case $choice in
+      '') if (( ${#keys} == 1 )); then choice=1; else
+            print -r -- "  enter a number from 1 to ${#keys}"; continue
+          fi ;;
+      <->) (( choice >= 1 && choice <= ${#keys} )) || {
+             print -r -- "  there's no key ${choice} — pick 1 to ${#keys}"; continue } ;;
+      [oO]|other)
+           local other=''
+           _gh_switch_ask "  path to the ssh key: " other || return 1
+           other=$(_gh_switch_clean_path "$other")
+           [[ -r $other ]] || { print -u2 -- "gh: can't read $other"; return 1 }
+           keys+=("$other"); choice=${#keys} ;;
+      [qQ]|quit) return 1 ;;
+      *) local typed; typed=$(_gh_switch_clean_path "$choice")
+         [[ -r $typed ]] || { print -r -- "  no key named '${choice}'"; continue }
+         keys+=("$typed"); choice=${#keys} ;;
+    esac
+    break
+  done
+
+  local key=${keys[choice]}
+  local -a f
+  local rec; rec=$(_gh_switch_account_for_key "$key")
+  if [[ -n $rec ]] && rec=$(_gh_switch_lookup "$rec"); then
+    f=("${(@s:	:)rec}")
+    _gh_switch_apply "${f[1]}" "$key" "${f[4]}" "${f[5]}"
+    print -r -- "✓ github identity: ${f[1]}${f[5]:+  (${f[4]} <${f[5]}>)}"
+    return 0
+  fi
+  _gh_switch_register "$key"
+}
+
+_gh_switch_usage() {
+  print -r -- "usage:
+  gh                     pick an ssh key; the github account comes with it
+  gh <account>           switch to an account you've already used
+  gh --keys              list the ssh keys in ~/.ssh and who each one is
+  gh --list              list known accounts
+  gh --status            who this shell is right now
+  gh --add <key-path>    register a key without the picker
+  gh --refresh           re-fetch name/email for the current account
+  gh --forget <account>  drop an account
+  gh --off               back to the default ssh key"
+}
+
+gh() {
+  emulate -L zsh
+  setopt localoptions no_nomatch extended_glob
+
+  local name=$1
+
+  case $name in
+    '') _gh_switch_pick; return $? ;;
+    -h|--help) _gh_switch_usage; return 0 ;;
+    -s|--status|--who)
+      if [[ -n $GH_IDENTITY ]]; then
+        local rec; rec=$(_gh_switch_lookup "$GH_IDENTITY")
+        local -a f; f=("${(@s:	:)rec}")
+        print -r -- "github.com/$GH_IDENTITY"
+        print -r -- "  key:     ${${f[2]:-?}/#$HOME/~}"
+        [[ -n ${f[5]} ]] && print -r -- "  commits: ${f[4]} <${f[5]}>"
+      else
+        print -r -- "(default ssh key — run 'gh' to pick one)"
+      fi
+      return 0 ;;
+    -l|--list)
+      if [[ -s $GH_SWITCH_DB ]]; then
+        awk -F'\t' -v h="$HOME" -v cur="$GH_IDENTITY" \
+          'NF{k=$2; sub("^" h, "~", k); printf "  %-20s %-28s %s%s\n", $1, k, $5, ($1==cur ? "  *" : "")}' \
+          "$GH_SWITCH_DB"
+      else
+        print -r -- "  (nothing yet — run: gh)"
+      fi
+      return 0 ;;
+    -k|--keys)
+      local -a keys; keys=( ${(f)"$(_gh_switch_find_keys)"} )
+      (( ${#keys} )) || { print -r -- "  no private keys in ~/.ssh"; return 1 }
+      local k acct
+      for k in $keys; do
+        acct=$(_gh_switch_account_for_key "$k")
+        printf '  %-22s %-8s %s\n' "${k#$HOME/.ssh/}" "$(_gh_switch_key_type "$k")" \
+               "${acct:+github.com/}${acct:-(not checked yet)}"
+      done
+      return 0 ;;
+    --add)
+      [[ -z $2 ]] && { print -u2 -- "gh: --add needs a key path"; return 2 }
+      local akey; akey=$(_gh_switch_clean_path "$2")
+      [[ -r $akey ]] || { print -u2 -- "gh: can't read $akey"; return 1 }
+      _gh_switch_register "$akey"; return $? ;;
+    --refresh)
+      [[ -z $GH_IDENTITY ]] && { print -u2 -- "gh: no identity in this shell"; return 1 }
+      local rec; rec=$(_gh_switch_lookup "$GH_IDENTITY") || return 1
+      local -a f; f=("${(@s:	:)rec}")
+      _gh_switch_register "${f[2]}"; return $? ;;
+    --forget)
+      [[ -z $2 ]] && { print -u2 -- "gh: --forget needs an account"; return 2 }
+      [[ -r $GH_SWITCH_DB ]] || { print -u2 -- "gh: nothing saved"; return 1 }
+      local tmp="$GH_SWITCH_DB.$$"
+      awk -F'\t' -v n="$2" 'NF && $1 != n' "$GH_SWITCH_DB" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$GH_SWITCH_DB"
+      print -r -- "forgot '$2'"
+      [[ $GH_IDENTITY == $2 ]] && gh --off
+      return 0 ;;
+    --off)
+      unset GIT_SSH_COMMAND GH_IDENTITY GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+      rm -f "$GH_SWITCH_LAST"
+      print -r -- "(default ssh key)"
+      return 0 ;;
+    -*) print -u2 -- "gh: unknown option '$name'"; _gh_switch_usage; return 2 ;;
+  esac
+
+  # If the real GitHub CLI is installed, let its own subcommands through.
+  local real; real=$(whence -p gh 2>/dev/null)
+  if [[ -n $real ]] && ! _gh_switch_lookup "$name" >/dev/null; then
+    case $name in
+      auth|browse|cache|codespace|gist|issue|org|pr|project|release|repo|run|\
+      workflow|alias|api|attestation|completion|config|extension|gpg-key|label|\
+      ruleset|search|secret|ssh-key|status|variable|version|help)
+        "$real" "$@"; return $? ;;
+    esac
+  fi
+
+  # gh <account> — switch to one we already know
+  local rec
+  if rec=$(_gh_switch_lookup "$name"); then
+    local -a f; f=("${(@s:	:)rec}")
+    if [[ ! -r ${f[2]} ]]; then
+      print -u2 -- "gh: the key for '$name' is gone: ${f[2]}"
+      print -u2 -- "    run 'gh' to pick another one"
+      return 1
+    fi
+    _gh_switch_apply "${f[1]}" "${f[2]}" "${f[4]}" "${f[5]}"
+    print -r -- "✓ github identity: ${f[1]}${f[5]:+  (${f[4]} <${f[5]}>)}"
+    return 0
+  fi
+
+  print -r -- "no key registered for '$name' yet — pick the one that belongs to it:"
+  _gh_switch_pick
+}
+
+# Re-apply the last identity in new shells, so a fresh tab doesn't silently
+# fall back to the default key. `gh --off` stops this.
+if [[ -r $GH_SWITCH_LAST && -z $GH_IDENTITY ]]; then
+  _gh_switch_restore=$(<"$GH_SWITCH_LAST")
+  if _gh_switch_rec=$(_gh_switch_lookup "$_gh_switch_restore"); then
+    _gh_switch_f=("${(@s:	:)_gh_switch_rec}")
+    [[ -r ${_gh_switch_f[2]} ]] && _gh_switch_apply "${_gh_switch_f[1]}" "${_gh_switch_f[2]}" "${_gh_switch_f[4]}" "${_gh_switch_f[5]}"
+  fi
+  unset _gh_switch_restore _gh_switch_rec _gh_switch_f
+fi
+
+# Tab-complete known account names after `gh `.
+if (( $+functions[compdef] )); then
+  _gh_switch_complete() {
+    local -a names
+    [[ -r $GH_SWITCH_DB ]] && names=( ${(f)"$(awk -F'\t' 'NF{print $1}' "$GH_SWITCH_DB")"} )
+    _describe -t accounts 'account' names
+    _values 'option' '--list' '--keys' '--status' '--add' '--refresh' '--forget' '--off' '--help'
+  }
+  compdef _gh_switch_complete gh
+fi
