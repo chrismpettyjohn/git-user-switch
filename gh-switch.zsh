@@ -13,6 +13,17 @@
 # Accounts live in ~/.config/gh-switch/identities, tab separated:
 # login, key path, login, commit name, commit email.
 
+# This file defines a shell function, so it has to be *sourced* — it exports
+# GIT_SSH_COMMAND and friends into the shell you're sitting in. Running it as a
+# program would set those in a child process that exits a moment later.
+if [[ $ZSH_EVAL_CONTEXT != *:file* ]]; then
+  print -u2 -- "gh-switch: source this file, don't run it:"
+  print -u2 -- "    source ${0}"
+  print -u2 -- "  to install it for every shell:"
+  print -u2 -- "    ./install.sh"
+  return 1 2>/dev/null || exit 1
+fi
+
 GH_SWITCH_DIR="${GH_SWITCH_DIR:-$HOME/.config/gh-switch}"
 GH_SWITCH_DB="$GH_SWITCH_DIR/identities"
 GH_SWITCH_LAST="$GH_SWITCH_DIR/last"
